@@ -117,8 +117,18 @@ type Event struct {
 //
 // If group is non-nil, the returned Event is made part of the group
 // associated with the specified group Event.
+//
+// Open calls unix.PerfEventOpen [perf_event_open(2)] passing PERF_FLAG_FD_CLOEXEC
+// by default. This is not compatible with systems running Linux kernel 3.13
+// or earlier. See OpenWithFlags() for an alternative.
 func Open(a *Attr, pid, cpu int, group *Event) (*Event, error) {
-	return open(a, pid, cpu, group, 0)
+	return open(a, pid, cpu, group, unix.PERF_FLAG_FD_CLOEXEC)
+}
+
+// OpenWithFlags is like Open but allows to specify the flags passed to
+// unix.PerfEventOpen [perf_event_open(2)].
+func OpenWithFlags(a *Attr, pid, cpu int, group *Event, flags int) (*Event, error) {
+	return open(a, pid, cpu, group, flags)
 }
 
 // OpenCGroup is like Open, but activates per-container system-wide
@@ -138,7 +148,6 @@ func open(a *Attr, pid, cpu int, group *Event, flags int) (*Event, error) {
 		groupfd = group.perffd
 	}
 
-	flags |= unix.PERF_FLAG_FD_CLOEXEC
 	fd, err := unix.PerfEventOpen(a.sysAttr(), pid, cpu, groupfd, flags)
 	if err != nil {
 		return nil, os.NewSyscallError("perf_event_open", err)
