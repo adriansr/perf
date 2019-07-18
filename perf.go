@@ -121,6 +121,10 @@ func Open(a *Attr, pid, cpu int, group *Event) (*Event, error) {
 	return open(a, pid, cpu, group, 0)
 }
 
+func OpenWithFlags(a *Attr, pid, cpu int, group *Event, flags int) (*Event, error) {
+	return open(a, pid, cpu, group, flags)
+}
+
 // OpenCGroup is like Open, but activates per-container system-wide
 // monitoring. If cgroupfs is mounted on /dev/cgroup, and the group to
 // monitor is called "test", then cgroupfd must be a file descriptor opened
