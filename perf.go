@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -142,8 +143,7 @@ func open(a *Attr, pid, cpu int, group *Event, flags int) (*Event, error) {
 		groupfd = group.perffd
 	}
 
-	flags |= unix.PERF_FLAG_FD_CLOEXEC
-	fd, err := unix.PerfEventOpen(a.sysAttr(), pid, cpu, groupfd, flags)
+	fd, err := perfEventOpen(a, pid, cpu, groupfd, flags)
 	if err != nil {
 		return nil, os.NewSyscallError("perf_event_open", err)
 	}
@@ -185,6 +185,35 @@ func open(a *Attr, pid, cpu int, group *Event, flags int) (*Event, error) {
 	return ev, nil
 }
 
+// perfEventOpen wraps the perf_event_open system call with some additional
+// logic around ensuring that file descriptors are marked close-on-exec.
+func perfEventOpen(a *Attr, pid, cpu, groupfd, flags int) (fd int, err error) {
+	sysAttr := a.sysAttr()
+	cloexecFlags := flags | unix.PERF_FLAG_FD_CLOEXEC
+
+	fd, err = unix.PerfEventOpen(sysAttr, pid, cpu, groupfd, cloexecFlags)
+	switch err {
+	case nil:
+		return fd, nil
+	case unix.EINVAL:
+		// PERF_FLAG_FD_CLOEXEC is only available in Linux 3.14
+		// and up, or in older kernels patched by distributions
+		// with backported perf updates. If we got EINVAL, try again
+		// without the flag, while holding syscall.ForkLock, following
+		// the standard library pattern in net/sock_cloexec.go.
+		syscall.ForkLock.RLock()
+		defer syscall.ForkLock.RUnlock()
+
+		fd, err = unix.PerfEventOpen(sysAttr, pid, cpu, groupfd, flags)
+		if err == nil {
+			unix.CloseOnExec(fd)
+		}
+		return fd, err
+	default:
+		return -1, err
+	}
+}
+
 // DefaultNumPages is the number of pages used by MapRing. There is no
 // fundamental logic to this number. We use it because that is what the perf
 // tool does.
@@ -208,7 +237,6 @@ func (ev *Event) MapRingNumPages(num int) error {
 	if ev.ring != nil {
 		return nil
 	}
-
 	pgSize := unix.Getpagesize()
 	size := (1 + num) * pgSize
 	const prot = unix.PROT_READ | unix.PROT_WRITE
@@ -219,10 +247,16 @@ func (ev *Event) MapRingNumPages(num int) error {
 	}
 
 	meta := (*unix.PerfEventMmapPage)(unsafe.Pointer(&ring[0]))
+
+	// Some systems do not fill in the data_offset and data_size fields
+	// of the metadata page correctly: Centos 6.9 and Debian 8 have been
+	// observed to do this. Try to detect this condition, and adjust
+	// the values accordingly.
 	if meta.Data_offset == 0 && meta.Data_size == 0 {
 		atomic.StoreUint64(&meta.Data_offset, uint64(pgSize))
 		atomic.StoreUint64(&meta.Data_size, uint64(num*pgSize))
 	}
+
 	ringdata := ring[meta.Data_offset:]
 
 	wakeupfd, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
@@ -274,9 +308,15 @@ func (ev *Event) Measure(f func()) (Count, error) {
 	if err := ev.Reset(); err != nil {
 		return Count{}, err
 	}
+	if err := ev.Enable(); err != nil {
+		return Count{}, err
+	}
 
-	doEnableRunDisable(uintptr(ev.perffd), f)
+	f()
 
+	if err := ev.Disable(); err != nil {
+		return Count{}, err
+	}
 	return ev.ReadCount()
 }
 
@@ -288,9 +328,15 @@ func (ev *Event) MeasureGroup(f func()) (GroupCount, error) {
 	if err := ev.Reset(); err != nil {
 		return GroupCount{}, err
 	}
+	if err := ev.Enable(); err != nil {
+		return GroupCount{}, err
+	}
 
-	doEnableRunDisable(uintptr(ev.perffd), f)
+	f()
 
+	if err := ev.Disable(); err != nil {
+		return GroupCount{}, err
+	}
 	return ev.ReadGroupCount()
 }
 
@@ -477,8 +523,8 @@ func (ev *Event) ioctlInt(number int, arg uintptr) error {
 	return nil
 }
 
-func (ev *Event) ioctlPointer(number int, arg unsafe.Pointer) error {
-	_, _, e := unix.Syscall(unix.SYS_IOCTL, uintptr(ev.perffd), uintptr(number), uintptr(arg))
+func (ev *Event) ioctlPointer(number uintptr, arg unsafe.Pointer) error {
+	_, _, e := unix.Syscall(unix.SYS_IOCTL, uintptr(ev.perffd), number, uintptr(arg))
 	if e != 0 {
 		return e
 	}
@@ -1227,8 +1273,8 @@ func (f *fields) uint32sizeBytes(b *[]byte) {
 	f.advance(4)
 	data := make([]byte, size)
 	copy(data, *f)
-	*b = data
 	f.advance(int(size))
+	*b = data
 }
 
 func (f *fields) uint64sizeBytes(b *[]byte) {
@@ -1236,8 +1282,8 @@ func (f *fields) uint64sizeBytes(b *[]byte) {
 	f.advance(8)
 	data := make([]byte, size)
 	copy(data, *f)
-	*b = data
 	f.advance(int(size))
+	*b = data
 }
 
 // duration decodes a duration into d.

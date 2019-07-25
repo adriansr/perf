@@ -220,9 +220,8 @@ func (ev *Event) poll() {
 func (ev *Event) doPoll(req pollreq) pollresp {
 	var timeout *unix.Timespec
 	if req.timeout > 0 {
-		sec := int64(req.timeout / time.Second)
-		nsec := int64(req.timeout) - sec*int64(time.Second)
-		timeout = &unix.Timespec{Sec: sec, Nsec: nsec}
+		ts := unix.NsecToTimespec(req.timeout.Nanoseconds())
+		timeout = &ts
 	}
 
 	pollfds := []unix.PollFd{
